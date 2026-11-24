@@ -6,7 +6,8 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest
+    # GitHub-arm64 runners are often saturated; use the Intel hosted runner.
+    runs-on: macos-15-intel
     env:
       THEOS: ${{ github.workspace }}/theos
     steps:
