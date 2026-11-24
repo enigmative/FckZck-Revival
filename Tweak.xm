@@ -318,8 +318,10 @@ static NSString *FZDesc(id o) {
 // KVC is used instead of hardcoded protobuf class/method names, because those
 // are generated per WhatsApp build. Every attempt is logged to fckzck.log.
 static NSMutableSet *gFZFullSyncHookedClasses;
-static NSMutableDictionary *gFZFullSyncOrigIMP;
 static NSMutableSet *gFZSetLogged;
+typedef struct { Class cls; IMP orig; } FZOrigEntry;
+static FZOrigEntry gFZOrigEntries[128];
+static int gFZOrigCount = 0;
 
 static void FZSetKeyValue(id obj, NSString *key, id value) {
     if (!obj || !key) return;
@@ -355,10 +357,11 @@ static void FZForceFullHistoryInProps(id props) {
 }
 
 static id FZFullSyncInit(id self, SEL _cmd) {
-    const char *cn = class_getName(object_getClass(self));
-    NSString *key = cn ? [NSString stringWithUTF8String:cn] : @"";
-    NSValue *box = gFZFullSyncOrigIMP[key];
-    IMP orig = [box pointerValue];
+    Class cls = object_getClass(self);
+    IMP orig = NULL;
+    for (int i = 0; i < gFZOrigCount; i++) {
+        if (gFZOrigEntries[i].cls == cls) { orig = gFZOrigEntries[i].orig; break; }
+    }
     id result = orig ? ((id (*)(id, SEL))orig)(self, _cmd) : self;
     FZForceFullHistoryInProps(result);
     return result;
@@ -368,7 +371,6 @@ static void FZInstallFullSyncHooks(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         gFZFullSyncHookedClasses = [NSMutableSet set];
-        gFZFullSyncOrigIMP = [NSMutableDictionary dictionary];
     });
     unsigned int count = 0;
     Class *classes = objc_copyClassList(&count);
@@ -391,11 +393,14 @@ static void FZInstallFullSyncHooks(void) {
         // replacement would return an uninitialised object.
         IMP original = method_getImplementation(m);
         if (!original) continue;
+        if (gFZOrigCount >= 128) { free(classes); return; }
         IMP reported = NULL;
         MSHookMessageEx(classes[i], sel_registerName("init"), (IMP)FZFullSyncInit, &reported);
-        gFZFullSyncOrigIMP[key] = [NSValue valueWithPointer:original];
+        gFZOrigEntries[gFZOrigCount].cls = classes[i];
+        gFZOrigEntries[gFZOrigCount].orig = original;
+        gFZOrigCount++;
         [gFZFullSyncHookedClasses addObject:key];
-        FZ(@"FckZck 1.32: hooked init on %s (substrate original=%p)", cn, reported);
+        FZ(@"FckZck 1.32: hooked init on %s", cn);
     }
     free(classes);
     FZ(@"FckZck 1.32: full-history classes hooked=%lu", (unsigned long)gFZFullSyncHookedClasses.count);
