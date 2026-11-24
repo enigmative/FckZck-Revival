@@ -159,9 +159,13 @@ static void FZLoadConfig(void) {
     // when runWhenInitialSyncFinished is actually reached.
     gHistoryMode = @"stock";
     FZ(@"FckZck 1.25: historySyncFailureMode=%@ (fixed)", gHistoryMode);
-    id fis = cfg[@"forceInitialSyncFinished"];
-    if ([fis respondsToSelector:@selector(boolValue)]) gForceInitialSyncFinished = [fis boolValue];
-    FZ(@"FckZck: forceInitialSyncFinished=%d", gForceInitialSyncFinished);
+    // 1.32: NEVER spoof isInitialSyncFinished. The key is ignored on purpose;
+    // leaving it in the plist is harmless.
+    if (cfg[@"forceInitialSyncFinished"]) {
+        FZ(@"FckZck 1.32: forceInitialSyncFinished key present but IGNORED (no spoofing)");
+    }
+    gForceInitialSyncFinished = NO;
+    FZ(@"FckZck 1.32: forceInitialSyncFinished=%d (must stay NO)", gForceInitialSyncFinished);
     id fs = cfg[@"forceSyncState"];
     if ([fs isKindOfClass:[NSNumber class]]) { gForceSyncState = fs; FZ(@"FckZck: forceSyncState=%@", fs); } else { FZ(@"FckZck: forceSyncState default=%@", gForceSyncState); }
     // 1.26.2: declare iOS 15 to the server (ClientPayload.UserAgent) and, optionally, to the app.
@@ -297,6 +301,106 @@ static NSString *FZDesc(id o) {
     if (x.length > 400) x = [x substringToIndex:400];
     return [NSString stringWithFormat:@"%@ %@", NSStringFromClass([o class]), FZMask(x)];
 }
+
+// -------------------------------------------------------------------------
+// 1.32: full-history request (reconstruction from BUILD-1.32.md).
+//
+// 1.26.x forced the companion bootstrap to "finished" so iOS 12 would not
+// log out after ~120 s (history_sync_timeout). Side effect: the primary
+// phone believed history sync was already done, so it never sent RECENT/FULL
+// chunks and both devices showed "Sync paused".
+//
+// 1.32 keeps the logout safety net but:
+//   - never spoofs isInitialSyncFinished (see new_isInit / new_runWhen below)
+//   - forces requireFullSync = YES in DeviceProps at pair time
+//   - raises HistorySyncConfig limits
+//
+// KVC is used instead of hardcoded protobuf class/method names, because those
+// are generated per WhatsApp build. Every attempt is logged to fckzck.log.
+static NSMutableSet *gFZFullSyncHookedClasses;
+static NSMutableDictionary *gFZFullSyncOrigIMP;
+static NSMutableSet *gFZSetLogged;
+
+static void FZSetKeyValue(id obj, NSString *key, id value) {
+    if (!obj || !key) return;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ gFZSetLogged = [NSMutableSet set]; });
+    NSString *lk = [NSString stringWithFormat:@"%@:%@", NSStringFromClass([obj class]), key];
+    BOOL ok = NO;
+    @try {
+        [obj setValue:value forKey:key];
+        ok = YES;
+    } @catch (NSException *e) {
+        ok = NO;
+    }
+    if (![gFZSetLogged containsObject:lk]) {
+        [gFZSetLogged addObject:lk];
+        FZ(@"FckZck 1.32: %@ %@=%@ on %@", ok ? @"set" : @"no setter for", key, value, NSStringFromClass([obj class]));
+    }
+}
+
+static void FZForceFullHistoryInProps(id props) {
+    if (!props) return;
+    FZ(@"FckZck 1.32: forcing full-history config on %@", NSStringFromClass([props class]));
+    // DeviceProps / client-props
+    FZSetKeyValue(props, @"requireFullSync", @YES);
+    FZSetKeyValue(props, @"historyRequireFullSync", @YES);
+    // HistorySyncConfig limits (365 days, 512 MB full, 1024 MB quota, 90 days recent)
+    FZSetKeyValue(props, @"historyFullSyncDaysLimit", @365);
+    FZSetKeyValue(props, @"historyFullSyncSizeMbLimit", @512);
+    FZSetKeyValue(props, @"historyStorageQuotaMb", @1024);
+    FZSetKeyValue(props, @"historyRecentSyncDaysLimit", @90);
+    FZSetKeyValue(props, @"onDemandReady", @YES);
+    FZSetKeyValue(props, @"isOnDemandReady", @YES);
+}
+
+static id FZFullSyncInit(id self, SEL _cmd) {
+    const char *cn = class_getName(object_getClass(self));
+    NSString *key = cn ? [NSString stringWithUTF8String:cn] : @"";
+    NSValue *box = gFZFullSyncOrigIMP[key];
+    IMP orig = [box pointerValue];
+    id result = orig ? ((id (*)(id, SEL))orig)(self, _cmd) : self;
+    FZForceFullHistoryInProps(result);
+    return result;
+}
+
+static void FZInstallFullSyncHooks(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        gFZFullSyncHookedClasses = [NSMutableSet set];
+        gFZFullSyncOrigIMP = [NSMutableDictionary dictionary];
+    });
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    if (!classes) { FZ(@"FckZck 1.32: objc_copyClassList returned NULL"); return; }
+    for (unsigned int i = 0; i < count; i++) {
+        const char *cn = class_getName(classes[i]);
+        if (!cn) continue;
+        BOOL match = (strstr(cn, "DeviceProps") != NULL) ||
+                     (strstr(cn, "HistorySyncConfig") != NULL) ||
+                     (strstr(cn, "HistorySync") != NULL && strstr(cn, "Config") != NULL);
+        if (!match) continue;
+        NSString *key = [NSString stringWithUTF8String:cn];
+        if ([gFZFullSyncHookedClasses containsObject:key]) continue;
+        Method m = class_getInstanceMethod(classes[i], sel_registerName("init"));
+        if (!m) continue;
+        const char *enc = method_getTypeEncoding(m);
+        if (!enc || strcmp(enc, "@16@0:8") != 0) continue;
+        // Capture the real implementation BEFORE hooking. Substrate may report a
+        // NULL original for inherited methods; without this fallback our init
+        // replacement would return an uninitialised object.
+        IMP original = method_getImplementation(m);
+        if (!original) continue;
+        IMP reported = NULL;
+        MSHookMessageEx(classes[i], sel_registerName("init"), (IMP)FZFullSyncInit, &reported);
+        gFZFullSyncOrigIMP[key] = [NSValue valueWithPointer:original];
+        [gFZFullSyncHookedClasses addObject:key];
+        FZ(@"FckZck 1.32: hooked init on %s (substrate original=%p)", cn, reported);
+    }
+    free(classes);
+    FZ(@"FckZck 1.32: full-history classes hooked=%lu", (unsigned long)gFZFullSyncHookedClasses.count);
+}
+// -------------------------------------------------------------------------
 
 static void FZDumpElem(id<FZElem> e, int depth, NSMutableString *out) {
     if (!e || depth > 8) return;
@@ -481,8 +585,10 @@ static void new_hsHandle(id self, SEL _cmd, id msg, id stanza) {
 
     if (gAutoFinishInitialBootstrap && isBootstrapInline && !gBootstrapSeen) {
         gBootstrapSeen = YES;
-        gForceInitialSyncFinished = YES;
-        FZ(@"FckZck 1.26: INITIAL_BOOTSTRAP received; completing the bootstrap in 6 s");
+        // 1.32: do NOT set gForceInitialSyncFinished here. We release the
+        // bootstrap UI via FZFinishBootstrap, but the real sync state must stay
+        // "not finished" so the primary keeps sending history chunks.
+        FZ(@"FckZck 1.32: INITIAL_BOOTSTRAP received; releasing bootstrap UI without spoofing sync state");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             FZFinishBootstrap("INITIAL_BOOTSTRAP received");
         });
@@ -616,8 +722,10 @@ static BOOL new_isInit(id self, SEL _cmd) {
     static int last = -1;
     if (last != (int)r) { last = (int)r; FZ(@"FckZck: HistorySyncCompanionService.isInitialSyncFinished -> %d", r); }
     if (gForceInitialSyncFinished) {
-        FZ(@"FckZck: forcing isInitialSyncFinished -> YES");
-        return YES;
+        // 1.32 safety: should never happen (config key is ignored and no code
+        // path sets it to YES anymore). Kept only as a last-resort guard.
+        FZ(@"FckZck 1.32: WARNING gForceInitialSyncFinished=YES; refusing to spoof");
+        return r;
     }
     return r;
 }
@@ -628,10 +736,10 @@ static void new_runWhen(id self, SEL _cmd, id blk) {
         BOOL realFinished = NO;
         @try { realFinished = orig_isInit ? orig_isInit(self, sel_registerName("isInitialSyncFinished")) : NO; } @catch (NSException *e) {}
         if (!realFinished) {
-            // This is the exact deadlock observed on iOS 12: the continuation is
-            // registered, but the Swift HistorySyncDevice never flips the state.
-            gForceInitialSyncFinished = YES;
-            FZ(@"FckZck 1.25: runWhenInitialSyncFinished while state=0; executing continuation directly");
+            // 1.32: run the UI continuation directly to avoid the stuck loading
+            // screen, but do NOT mark initial sync as finished. The primary must
+            // still believe history sync is in progress.
+            FZ(@"FckZck 1.32: runWhenInitialSyncFinished while state=0; executing UI continuation without spoofing sync state");
             @try {
                 void (^continuation)(void) = (void (^)(void))blk;
                 continuation();
@@ -1218,6 +1326,15 @@ static void FZHookExpiryMethods(void) {
 
 %ctor {
     FZLoadConfig();
+    // 1.32: request full history from the primary. Protobuf classes may be
+    // registered lazily, so retry a few times.
+    FZInstallFullSyncHooks();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        FZInstallFullSyncHooks();
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        FZInstallFullSyncHooks();
+    });
     FZInstallKeychainHooks();
     {
         NSDictionary *bcfg = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.ifilipis.fckzck.plist"];
@@ -1359,6 +1476,9 @@ static void FZHookExpiryMethods(void) {
 - (void)devicePairingSession:(id)session didRequestPairDeviceWithRef:(id)ref authKey:(id)authKey identityKey:(id)identityKey hmacSignedDeviceIdentity:(id)hmac keyIndexList:(id)keyIndexList refCert:(id)refCert clientProps:(id)clientProps completion:(id)completion {
     FZ(@"FckZck: PAIR request ref=%@ authKey=%@ identityKey=%@ hmacSignedDeviceIdentity=%@ keyIndexList=%@ refCert=%@ clientProps=%@",
        FZDesc(ref), FZDesc(authKey), FZDesc(identityKey), FZDesc(hmac), FZDesc(keyIndexList), FZDesc(refCert), FZDesc(clientProps));
+    // 1.32: this is the exact moment DeviceProps/client-props are serialized
+    // into the pair request. Force requireFullSync + raise history limits here.
+    FZForceFullHistoryInProps(clientProps);
     %orig;
 }
 
